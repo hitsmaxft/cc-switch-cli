@@ -1,5 +1,6 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::RwLock;
 
 use crate::{app_config::AppType, database::Database, provider::Provider};
@@ -11,16 +12,211 @@ use super::{
     error::ProxyError,
 };
 
+/// Provider 缓存项，按 app_type 存储当前 provider
+#[derive(Clone, Debug)]
+struct CachedProvider {
+    provider: Provider,
+    /// 缓存版本号，用于检测是否需要刷新
+    version: u64,
+}
+
 pub struct ProviderRouter {
     db: Arc<Database>,
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// 当前 provider 缓存：app_type -> CachedProvider
+    current_cache: Arc<RwLock<HashMap<String, CachedProvider>>>,
+    /// 缓存版本计数器，每次文件变更时递增
+    cache_version: Arc<RwLock<u64>>,
 }
 
 impl ProviderRouter {
     pub fn new(db: Arc<Database>) -> Self {
-        Self {
+        let router = Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            current_cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_version: Arc::new(RwLock::new(0)),
+        };
+        router.spawn_file_watcher();
+        router
+    }
+
+    /// 启动文件 watcher，监听 provider 变更信号
+    fn spawn_file_watcher(&self) {
+        let watch_path = Self::provider_change_signal_path();
+        let cache_version = self.cache_version.clone();
+        let current_cache = self.current_cache.clone();
+        let db = self.db.clone();
+
+        tokio::spawn(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<Event>>(32);
+
+            let mut watcher = match RecommendedWatcher::new(
+                move |res| {
+                    let _ = tx.blocking_send(res);
+                },
+                Config::default(),
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    log::error!("[ProviderRouter] Failed to create file watcher: {}", e);
+                    return;
+                }
+            };
+
+            // 确保父目录存在
+            if let Some(parent) = watch_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    log::error!("[ProviderRouter] Failed to create watch dir: {}", e);
+                    return;
+                }
+            }
+
+            // 如果信号文件不存在，创建一个空文件
+            if !watch_path.exists() {
+                if let Err(e) = std::fs::write(&watch_path, "") {
+                    log::error!("[ProviderRouter] Failed to create watch file: {}", e);
+                    return;
+                }
+            }
+
+            if let Err(e) = watcher.watch(&watch_path, RecursiveMode::NonRecursive) {
+                log::error!("[ProviderRouter] Failed to watch file: {}", e);
+                return;
+            }
+
+            log::info!(
+                "[ProviderRouter] Watching provider change signal at {:?}",
+                watch_path
+            );
+
+            while let Some(res) = rx.recv().await {
+                match res {
+                    Ok(event) => {
+                        // 只关心写入和创建事件
+                        if event.kind.is_modify() || event.kind.is_create() {
+                            log::info!("[ProviderRouter] Provider change signal detected");
+
+                            // 递增版本号
+                            let mut version = cache_version.write().await;
+                            *version += 1;
+                            let new_version = *version;
+                            drop(version);
+
+                            // 预加载所有 app_type 的 provider 到缓存
+                            let app_types = vec![
+                                AppType::Claude,
+                                AppType::Codex,
+                                AppType::Gemini,
+                                AppType::OpenCode,
+                                AppType::OpenClaw,
+                            ];
+
+                            let mut cache = current_cache.write().await;
+                            for app_type in app_types {
+                                match Self::load_current_provider(&db, app_type.as_str()).await {
+                                    Ok(Some(provider)) => {
+                                        log::info!(
+                                            "[ProviderRouter] Preloaded provider for {}: {} (v{})",
+                                            app_type.as_str(),
+                                            provider.name,
+                                            new_version
+                                        );
+                                        cache.insert(
+                                            app_type.as_str().to_string(),
+                                            CachedProvider {
+                                                provider,
+                                                version: new_version,
+                                            },
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        log::info!(
+                                            "[ProviderRouter] No provider configured for {}",
+                                            app_type.as_str()
+                                        );
+                                        cache.remove(app_type.as_str());
+                                    }
+                                    Err(e) => {
+                                        log::error!(
+                                            "[ProviderRouter] Failed to preload provider for {}: {}",
+                                            app_type.as_str(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("[ProviderRouter] Watch error: {}", e);
+                    }
+                }
+            }
+
+            log::warn!("[ProviderRouter] File watcher channel closed");
+        });
+    }
+
+    /// 获取 provider 变更信号文件路径
+    fn provider_change_signal_path() -> PathBuf {
+        crate::config::get_app_config_dir().join("provider.changed")
+    }
+
+    /// 从 DB 加载指定 app_type 的当前 provider
+    async fn load_current_provider(
+        db: &Database,
+        app_type: &str,
+    ) -> Result<Option<Provider>, ProxyError> {
+        let current_id = db
+            .get_current_provider(app_type)
+            .map_err(|error| ProxyError::DatabaseError(error.to_string()))?;
+
+        match current_id {
+            Some(current_id) => db
+                .get_provider_by_id(&current_id, app_type)
+                .map_err(|error| ProxyError::DatabaseError(error.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    /// 获取当前 provider（带缓存）
+    async fn get_cached_current_provider(
+        &self,
+        app_type: &str,
+    ) -> Result<Option<Provider>, ProxyError> {
+        let cache_version = *self.cache_version.read().await;
+
+        // 先检查缓存
+        {
+            let cache = self.current_cache.read().await;
+            if let Some(cached) = cache.get(app_type) {
+                if cached.version == cache_version {
+                    // 缓存命中且版本一致
+                    return Ok(Some(cached.provider.clone()));
+                }
+                // 版本不匹配，需要刷新
+            }
+        }
+
+        // 缓存未命中或版本过期，从 DB 加载
+        match Self::load_current_provider(&self.db, app_type).await? {
+            Some(provider) => {
+                let mut cache = self.current_cache.write().await;
+                cache.insert(
+                    app_type.to_string(),
+                    CachedProvider {
+                        provider: provider.clone(),
+                        version: cache_version,
+                    },
+                );
+                Ok(Some(provider))
+            }
+            None => {
+                let mut cache = self.current_cache.write().await;
+                cache.remove(app_type);
+                Ok(None)
+            }
         }
     }
 
@@ -67,7 +263,7 @@ impl ProviderRouter {
                 }
             }
         } else {
-            if let Some(current) = self.current_provider(app_type)? {
+            if let Some(current) = self.get_cached_current_provider(app_type).await? {
                 total_providers = 1;
                 result.push(current);
             }
@@ -185,27 +381,6 @@ impl ProviderRouter {
         endpoint: &str,
     ) -> String {
         upstream_endpoint::rewrite_upstream_endpoint(app_type, provider, endpoint)
-    }
-
-    fn current_provider_id(&self, app_type: &AppType) -> Option<String> {
-        crate::settings::get_effective_current_provider(&self.db, app_type)
-            .ok()
-            .flatten()
-    }
-
-    fn current_provider(&self, app_type: &str) -> Result<Option<Provider>, ProxyError> {
-        let current_id = AppType::from_str(app_type)
-            .ok()
-            .and_then(|app_enum| self.current_provider_id(&app_enum))
-            .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
-
-        match current_id {
-            Some(current_id) => self
-                .db
-                .get_provider_by_id(&current_id, app_type)
-                .map_err(|error| ProxyError::DatabaseError(error.to_string())),
-            None => Ok(None),
-        }
     }
 
     async fn get_or_create_circuit_breaker(&self, key: &str) -> Arc<CircuitBreaker> {

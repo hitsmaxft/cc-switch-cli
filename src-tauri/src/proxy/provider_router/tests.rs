@@ -80,7 +80,10 @@ async fn test_failover_disabled_uses_current_provider() {
 
 #[tokio::test]
 #[serial]
-async fn test_failover_disabled_prefers_effective_current_provider_from_settings() {
+async fn test_failover_disabled_uses_db_as_source_of_truth() {
+    // The proxy is a long-running process; other processes (e.g. `cc-switch
+    // provider switch`) only update the database.  The in-process settings
+    // store (OnceLock) is never reloaded, so the DB must be the authority.
     let _home = TempHome::new();
     let db = Arc::new(Database::memory().unwrap());
 
@@ -89,14 +92,17 @@ async fn test_failover_disabled_prefers_effective_current_provider_from_settings
 
     db.save_provider("claude", &provider_a).unwrap();
     db.save_provider("claude", &provider_b).unwrap();
+
+    // DB says "a"; in-process settings says "b" (simulates a stale cache).
     db.set_current_provider("claude", "a").unwrap();
     crate::settings::set_current_provider(&crate::app_config::AppType::Claude, Some("b")).unwrap();
 
     let router = ProviderRouter::new(db.clone());
     let providers = router.select_providers("claude").await.unwrap();
 
+    // DB is the authority; the stale in-process value must be ignored.
     assert_eq!(providers.len(), 1);
-    assert_eq!(providers[0].id, "b");
+    assert_eq!(providers[0].id, "a");
 }
 
 #[tokio::test]

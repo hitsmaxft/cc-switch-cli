@@ -1622,7 +1622,20 @@ impl ProviderService {
             crate::settings::set_current_provider(&app_type, Some(provider_id))?;
         }
 
+        // 通知 proxy 重新加载 provider 缓存
+        Self::notify_proxy_provider_changed();
+
         Ok(())
+    }
+
+    /// 通知 proxy 进程 provider 已变更
+    fn notify_proxy_provider_changed() {
+        let signal_path = crate::config::get_app_config_dir().join("provider.changed");
+        if let Err(e) = std::fs::write(&signal_path, format!("{}", chrono::Utc::now().to_rfc3339())) {
+            log::warn!("Failed to write provider change signal: {}", e);
+        } else {
+            log::info!("Notified proxy of provider change via {:?}", signal_path);
+        }
     }
 
     fn write_live_snapshot(
