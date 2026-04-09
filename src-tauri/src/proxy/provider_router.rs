@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::RwLock;
@@ -32,13 +32,54 @@ pub struct ProviderRouter {
 impl ProviderRouter {
     pub fn new(db: Arc<Database>) -> Self {
         let router = Self {
-            db,
+            db: db.clone(),
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
             current_cache: Arc::new(RwLock::new(HashMap::new())),
             cache_version: Arc::new(RwLock::new(0)),
         };
         router.spawn_file_watcher();
+        router.log_initial_providers();
         router
+    }
+
+    /// 启动时打印当前激活的 provider
+    fn log_initial_providers(&self) {
+        let db = self.db.clone();
+        tokio::spawn(async move {
+            let app_types = vec![
+                AppType::Claude,
+                AppType::Codex,
+                AppType::Gemini,
+                AppType::OpenCode,
+                AppType::OpenClaw,
+            ];
+            for app_type in app_types {
+                match Self::load_current_provider(&db, app_type.as_str()).await {
+                    Ok(Some(provider)) => {
+                        let stream_usage = provider.stream_include_usage();
+                        log::info!(
+                            "[ProviderRouter] [{}] initial provider: {} (stream_include_usage={})",
+                            app_type.as_str(),
+                            provider.name,
+                            stream_usage
+                        );
+                    }
+                    Ok(None) => {
+                        log::info!(
+                            "[ProviderRouter] [{}] no provider configured",
+                            app_type.as_str()
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "[ProviderRouter] [{}] failed to load initial provider: {}",
+                            app_type.as_str(),
+                            e
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// 启动文件 watcher，监听 provider 变更信号
@@ -116,11 +157,12 @@ impl ProviderRouter {
                             for app_type in app_types {
                                 match Self::load_current_provider(&db, app_type.as_str()).await {
                                     Ok(Some(provider)) => {
+                                        let stream_usage = provider.stream_include_usage();
                                         log::info!(
-                                            "[ProviderRouter] Preloaded provider for {}: {} (v{})",
+                                            "[ProviderRouter] [{}] switched to provider: {} (stream_include_usage={})",
                                             app_type.as_str(),
                                             provider.name,
-                                            new_version
+                                            stream_usage
                                         );
                                         cache.insert(
                                             app_type.as_str().to_string(),
